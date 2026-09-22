@@ -80,6 +80,25 @@ Render Free подходит для демо, но не для постоянн�
 free web service засыпает после простоя, а локальная файловая система может
 очищаться при рестартах/редеплоях.
 
+### Keepalive на 3 дня
+
+Чтобы демо не засыпало во время короткого публичного показа, добавлен GitHub
+Actions workflow `.github/workflows/keep-render-awake.yml`. Он дергает
+`/healthz` каждые 10 минут до `2026-09-25T23:59:00Z`.
+
+Если Render выдал URL не `https://lct-leaderboard.onrender.com`, в GitHub нужно
+создать repository variable:
+
+```text
+LEADERBOARD_URL=https://your-render-url.onrender.com
+```
+
+Если нужно продлить окно, поменять:
+
+```text
+KEEPALIVE_UNTIL=2026-09-25T23:59:00Z
+```
+
 Импорт manifest из архива:
 
 ```powershell
