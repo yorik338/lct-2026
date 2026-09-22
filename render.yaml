@@ -3,11 +3,15 @@ services:
     name: lct-leaderboard
     runtime: python
     plan: free
-    buildCommand: "python --version"
-    startCommand: "python -m lct_leaderboard.web"
+    branch: develop
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "PYTHONPATH=src python -m lct_leaderboard.web"
+    healthCheckPath: /healthz
     envVars:
       - key: PYTHONPATH
         value: src
+      - key: PYTHON_VERSION
+        value: 3.12.8
       - key: LCT_DATA_DIR
         value: data
       - key: LCT_CATALOG_PATH
