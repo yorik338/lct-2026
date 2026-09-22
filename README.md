@@ -33,6 +33,7 @@ http://localhost:8000
 - `/download/input` - входной датасет;
 - `/download/catalog` - каталог правил и ставок;
 - `/download/sample-result` - пример валидного результата, если задан `LCT_SAMPLE_RESULT_PATH`.
+- `/download/examples` - zip с 30 примерами входных датасетов.
 
 ## Публичный демо-доступ через Cloudflare Tunnel
 
@@ -76,6 +77,7 @@ python -m lct_leaderboard.web
   - `LCT_CATALOG_PATH=demo_data/rule_catalog.json`;
   - `LCT_INPUT_PATH=demo_data/input.geojson`;
   - `LCT_SAMPLE_RESULT_PATH=demo_data/valid_result.geojson`.
+  - `LCT_EXAMPLES_ZIP_PATH=demo_data/examples_30.zip`;
   - `LCT_MAX_SUBMISSIONS_PER_TEAM_DATASET=3`;
   - `LCT_SUBMISSIONS_CLOSE_AT=2026-09-25T23:59:00Z`.
 

@@ -287,6 +287,12 @@ def _download_registry() -> Dict[str, Dict[str, str]]:
             "filename": "valid_result.geojson",
             "content_type": "application/geo+json; charset=utf-8",
         },
+        "/download/examples": {
+            "label": "30 example datasets",
+            "path": os.environ.get("LCT_EXAMPLES_ZIP_PATH", ""),
+            "filename": "examples_30.zip",
+            "content_type": "application/zip",
+        },
     }
 
 
@@ -698,6 +704,7 @@ def _render_download_links(config_status: Dict[str, Any]) -> str:
         "Input dataset": "/download/input",
         "Rule catalog": "/download/catalog",
         "Sample result": "/download/sample-result",
+        "30 example datasets": "/download/examples",
     }
     for item in config_status.get("downloads", []):
         label = item["label"]
