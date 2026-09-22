@@ -1,9 +1,11 @@
 import cgi
+import csv
 import html
+import io
 import json
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,6 +27,9 @@ class AppState:
         self.upload_dir = self.data_dir / "uploads"
         self.db_path = self.data_dir / "leaderboard.sqlite"
         self.max_upload_bytes = int(os.environ.get("LCT_MAX_UPLOAD_BYTES", "25000000"))
+        self.max_submissions_per_team = int(
+            os.environ.get("LCT_MAX_SUBMISSIONS_PER_TEAM_DATASET", "3")
+        )
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         _init_db(self.db_path)
@@ -40,6 +45,12 @@ class LeaderboardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/download/"):
             self._serve_download(parsed.path)
+            return
+        if parsed.path == "/export.csv":
+            self._serve_export(parsed.query)
+            return
+        if parsed.path == "/submission":
+            self._serve_submission_report(parsed.query)
             return
         if parsed.path != "/":
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -84,10 +95,20 @@ class LeaderboardHandler(BaseHTTPRequestHandler):
             dataset_id = _form_value(form, "dataset_id").strip() or dataset_id
             upload = form["result_file"] if "result_file" in form else None
 
-            if not team_id:
-                raise ValueError("Укажите команду.")
+            team_id = _normalize_team_id(team_id)
+            if _submissions_closed():
+                raise ValueError("Прием сабмитов закрыт.")
             if upload is None or not getattr(upload, "filename", ""):
                 raise ValueError("Загрузите result.geojson.")
+            if not _looks_like_geojson_filename(upload.filename):
+                raise ValueError("Файл результата должен быть .geojson или .json.")
+            if (
+                _submission_count(self.state.db_path, team_id, dataset_id)
+                >= self.state.max_submissions_per_team
+            ):
+                raise ValueError(
+                    "Лимит сабмитов для этой команды и датасета уже исчерпан."
+                )
 
             catalog = RuleCatalog.from_dict(read_json(_required_env("LCT_CATALOG_PATH")))
             input_geojson = _optional_input_geojson()
@@ -134,6 +155,18 @@ class LeaderboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _send_csv(self, text: str, filename: str) -> None:
+        payload = text.encode("utf-8-sig")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header(
+            "Content-Disposition",
+            f'attachment; filename="{_safe_name(filename)}"',
+        )
+        self.end_headers()
+        self.wfile.write(payload)
+
     def _send_bytes(self, payload: bytes, filename: str, content_type: str) -> None:
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
@@ -163,6 +196,28 @@ class LeaderboardHandler(BaseHTTPRequestHandler):
             )
         except FileNotFoundError:
             self.send_error(HTTPStatus.NOT_FOUND, "Configured file was not found")
+
+    def _serve_export(self, query: str) -> None:
+        params = parse_qs(query)
+        dataset_id = _first(params, "dataset_id") or "new_tz_smoke"
+        submissions = _list_submissions(self.state.db_path, dataset_id=dataset_id)
+        leaderboard = _leaderboard_for_dataset(submissions, dataset_id)
+        self._send_csv(
+            _leaderboard_csv(leaderboard),
+            filename=f"leaderboard_{dataset_id}.csv",
+        )
+
+    def _serve_submission_report(self, query: str) -> None:
+        params = parse_qs(query)
+        submission_id = _first(params, "id")
+        if submission_id is None or not submission_id.isdigit():
+            self.send_error(HTTPStatus.BAD_REQUEST, "Invalid submission id")
+            return
+        report = _submission_report(self.state.db_path, int(submission_id))
+        if report is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        self._send_json(report)
 
     def _redirect(self, location: str) -> None:
         self.send_response(HTTPStatus.SEE_OTHER)
@@ -199,9 +254,15 @@ def _config_status() -> Dict[str, Any]:
     sample_result_path = os.environ.get("LCT_SAMPLE_RESULT_PATH")
     return {
         "ready": bool(catalog_path),
-        "catalog_path": catalog_path,
-        "input_path": input_path,
-        "sample_result_path": sample_result_path,
+        "submissions_closed": _submissions_closed(),
+        "submissions_close_at": os.environ.get("LCT_SUBMISSIONS_CLOSE_AT", ""),
+        "max_submissions_per_team": int(
+            os.environ.get("LCT_MAX_SUBMISSIONS_PER_TEAM_DATASET", "3")
+        ),
+        "max_upload_mb": round(
+            int(os.environ.get("LCT_MAX_UPLOAD_BYTES", "25000000")) / 1_000_000,
+            1,
+        ),
         "downloads": list(_download_registry().values()),
     }
 
@@ -237,6 +298,7 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 
 def _init_db(db_path: Path) -> None:
     with _connect(db_path) as connection:
+        connection.execute("PRAGMA journal_mode=WAL")
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS submissions (
@@ -253,6 +315,15 @@ def _init_db(db_path: Path) -> None:
                 result_path TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_submissions_dataset ON submissions(dataset_id)"
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_submissions_team_dataset
+            ON submissions(team_id, dataset_id)
             """
         )
 
@@ -336,6 +407,43 @@ def _list_submissions(db_path: Path, dataset_id: str) -> List[Dict[str, Any]]:
             (dataset_id,),
         ).fetchall()
     return [_row_to_submission(row) for row in rows]
+
+
+def _submission_count(db_path: Path, team_id: str, dataset_id: str) -> int:
+    with _connect(db_path) as connection:
+        row = connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM submissions
+            WHERE team_id = ? AND dataset_id = ?
+            """,
+            (team_id, dataset_id),
+        ).fetchone()
+    return int(row["count"])
+
+
+def _submission_report(db_path: Path, submission_id: int) -> Optional[Dict[str, Any]]:
+    with _connect(db_path) as connection:
+        row = connection.execute(
+            """
+            SELECT id, team_id, dataset_id, status, accepted, report_json, created_at
+            FROM submissions
+            WHERE id = ?
+            """,
+            (submission_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    report = json.loads(row["report_json"])
+    report["submission"] = {
+        "id": row["id"],
+        "team_id": row["team_id"],
+        "dataset_id": row["dataset_id"],
+        "status": row["status"],
+        "accepted": bool(row["accepted"]),
+        "created_at": row["created_at"],
+    }
+    return report
 
 
 def _row_to_submission(row: sqlite3.Row) -> Dict[str, Any]:
@@ -430,6 +538,32 @@ def _first(params: Dict[str, List[str]], name: str) -> Optional[str]:
     return values[0] if values else None
 
 
+def _normalize_team_id(value: str) -> str:
+    normalized = " ".join(value.strip().split())
+    if not normalized:
+        raise ValueError("Укажите команду.")
+    if len(normalized) > 64:
+        raise ValueError("Название команды должно быть не длиннее 64 символов.")
+    return normalized
+
+
+def _looks_like_geojson_filename(filename: str) -> bool:
+    lowered = filename.lower()
+    return lowered.endswith(".geojson") or lowered.endswith(".json")
+
+
+def _submissions_closed(now: Optional[datetime] = None) -> bool:
+    raw_deadline = os.environ.get("LCT_SUBMISSIONS_CLOSE_AT", "").strip()
+    if not raw_deadline:
+        return False
+    normalized = raw_deadline.replace("Z", "+00:00")
+    deadline = datetime.fromisoformat(normalized)
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    return current >= deadline
+
+
 def _e(value: Any) -> str:
     return html.escape("" if value is None else str(value), quote=True)
 
@@ -457,6 +591,8 @@ def _render_page(
     message_html = f'<div class="notice ok">{_e(message)}</div>' if message else ""
     error_html = f'<div class="notice error">{_e(error)}</div>' if error else ""
     download_links = _render_download_links(config_status)
+    disabled_attr = " disabled" if config_status.get("submissions_closed") else ""
+    submit_label = "Submissions closed" if config_status.get("submissions_closed") else "Submit"
 
     return f"""<!doctype html>
 <html lang="ru">
@@ -480,7 +616,7 @@ def _render_page(
     <div class="workspace">
       <div>
         <section>
-          <h2>Leaderboard</h2>
+          <div class="section-head"><h2>Leaderboard</h2><a class="inline-link" href="/export.csv?dataset_id={_e(dataset_id)}">Export CSV</a></div>
           <table>
             <thead><tr><th>Rank</th><th>Team</th><th class="number">Score</th><th class="number">Cost</th><th class="number">Length</th><th>Status</th></tr></thead>
             <tbody>{leaderboard_rows}</tbody>
@@ -502,19 +638,19 @@ def _render_page(
         <section class="panel">
           <h2>Upload result</h2>
           <form method="post" action="/submit" enctype="multipart/form-data">
-            <div class="field"><label for="team_id">Team</label><input id="team_id" name="team_id" autocomplete="organization" required></div>
-            <div class="field"><label for="dataset_id">Dataset</label><input id="dataset_id" name="dataset_id" value="{_e(dataset_id)}" required></div>
-            <div class="field"><label for="result_file">GeoJSON result</label><input id="result_file" name="result_file" type="file" accept=".geojson,.json,application/json" required></div>
-            <button type="submit">Submit</button>
+            <div class="field"><label for="team_id">Team</label><input id="team_id" name="team_id" autocomplete="organization" maxlength="64" required{disabled_attr}></div>
+            <div class="field"><label for="dataset_id">Dataset</label><input id="dataset_id" name="dataset_id" value="{_e(dataset_id)}" required{disabled_attr}></div>
+            <div class="field"><label for="result_file">GeoJSON result</label><input id="result_file" name="result_file" type="file" accept=".geojson,.json,application/json" required{disabled_attr}></div>
+            <button type="submit"{disabled_attr}>{submit_label}</button>
           </form>
         </section>
         <section class="panel">
-          <h2>Runtime config</h2>
+          <h2>Rules</h2>
           <div class="config">
-            <div>Catalog: {_e(config_status.get("catalog_path") or "not configured")}</div>
-            <div>Input: {_e(config_status.get("input_path") or "not configured")}</div>
-            <div>Sample: {_e(config_status.get("sample_result_path") or "not configured")}</div>
-            <div>Ready: {"yes" if config_status.get("ready") else "no"}</div>
+            <div>Variants per team/dataset: {_e(config_status.get("max_submissions_per_team"))}</div>
+            <div>Upload limit: {_e(config_status.get("max_upload_mb"))} MB</div>
+            <div>Deadline: {_e(config_status.get("submissions_close_at") or "not set")}</div>
+            <div>Status: {"closed" if config_status.get("submissions_closed") else "open"}</div>
           </div>
         </section>
       </aside>
@@ -532,7 +668,28 @@ def _render_leaderboard_row(row: Dict[str, Any]) -> str:
 
 def _render_submission_row(row: Dict[str, Any]) -> str:
     status_class = "" if row["accepted"] else " bad"
-    return f"""<tr><td>#{row["id"]}</td><td>{_e(row["team_id"])}</td><td><span class="status{status_class}">{_e(row["status"])}</span></td><td class="number">{row["warning_count"]}</td><td class="number">{row["critical_count"]}</td><td>{_e(row["created_at"])}</td></tr>"""
+    return f"""<tr><td><a class="inline-link" href="/submission?id={row["id"]}">#{row["id"]}</a></td><td>{_e(row["team_id"])}</td><td><span class="status{status_class}">{_e(row["status"])}</span></td><td class="number">{row["warning_count"]}</td><td class="number">{row["critical_count"]}</td><td>{_e(row["created_at"])}</td></tr>"""
+
+
+def _leaderboard_csv(rows: List[Dict[str, Any]]) -> str:
+    output = io.StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=[
+            "rank",
+            "team_id",
+            "submission_id",
+            "accepted",
+            "leaderboard_score",
+            "calculated_cost",
+            "new_network_length",
+            "warning_count",
+        ],
+    )
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return output.getvalue()
 
 
 def _render_download_links(config_status: Dict[str, Any]) -> str:
@@ -562,6 +719,10 @@ main { max-width: 1240px; margin: 0 auto; padding: 28px 32px 56px; }
 .workspace { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 28px; align-items: start; }
 section { margin-bottom: 28px; }
 h2 { margin: 0 0 14px; font-size: 15px; line-height: 1.3; font-weight: 720; }
+.section-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
+.section-head h2 { margin: 0; }
+.inline-link { color: var(--accent); font-size: 13px; font-weight: 680; text-decoration: none; }
+.inline-link:hover { text-decoration: underline; }
 .meta { color: var(--muted); font-size: 13px; line-height: 1.45; }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 18px; }
 table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; font-size: 14px; }
@@ -576,6 +737,7 @@ input { width: 100%; min-height: 40px; padding: 9px 10px; border: 1px solid var(
 input:focus { outline: 2px solid rgba(15,118,110,.18); border-color: var(--accent); }
 .field { margin-bottom: 14px; }
 button { width: 100%; min-height: 42px; border: 0; border-radius: 6px; background: var(--accent); color: white; font-weight: 760; cursor: pointer; }
+button:disabled, input:disabled { cursor: not-allowed; opacity: .58; }
 .notice { margin-bottom: 18px; padding: 12px 14px; border-radius: 8px; border: 1px solid var(--line); background: white; font-size: 14px; }
 .notice.error { border-color: #fecdca; color: var(--bad); background: #fff7f6; }
 .notice.ok { border-color: #abefc6; color: var(--ok); background: #f6fef9; }

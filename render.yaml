@@ -20,3 +20,7 @@ services:
         value: demo_data/input.geojson
       - key: LCT_SAMPLE_RESULT_PATH
         value: demo_data/valid_result.geojson
+      - key: LCT_MAX_SUBMISSIONS_PER_TEAM_DATASET
+        value: "3"
+      - key: LCT_SUBMISSIONS_CLOSE_AT
+        value: "2026-09-25T23:59:00Z"

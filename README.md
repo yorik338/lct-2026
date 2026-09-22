@@ -67,14 +67,17 @@ python -m lct_leaderboard.web
 
 - Branch: `develop`;
 - Runtime: `Python`;
-- Build Command: `python --version`;
-- Start Command: `python -m lct_leaderboard.web`;
+- Build Command: `pip install -r requirements.txt`;
+- Start Command: `PYTHONPATH=src python -m lct_leaderboard.web`;
 - Env:
   - `PYTHONPATH=src`;
+  - `PYTHON_VERSION=3.12.8`;
   - `LCT_DATA_DIR=data`;
   - `LCT_CATALOG_PATH=demo_data/rule_catalog.json`;
   - `LCT_INPUT_PATH=demo_data/input.geojson`;
   - `LCT_SAMPLE_RESULT_PATH=demo_data/valid_result.geojson`.
+  - `LCT_MAX_SUBMISSIONS_PER_TEAM_DATASET=3`;
+  - `LCT_SUBMISSIONS_CLOSE_AT=2026-09-25T23:59:00Z`.
 
 Render Free подходит для демо, но не для постоянной боевой борды без внешней БД:
 free web service засыпает после простоя, а локальная файловая система может
@@ -128,3 +131,15 @@ archive.zip!path/inside/archive.json
 - расхождения с заявленным `variant_summary`.
 
 Полные инженерные проверки геометрии будут добавлены отдельным слоем.
+
+## Боевой минимум
+
+В текущей версии включены:
+
+- лимит 3 сабмита на команду и датасет;
+- deadline через `LCT_SUBMISSIONS_CLOSE_AT`;
+- скрытие локальных путей из публичного UI;
+- экспорт лидерборда в CSV;
+- JSON-отчет по каждому сабмиту;
+- health-check `/healthz` для Render;
+- GitHub Actions keepalive на 3 дня.
